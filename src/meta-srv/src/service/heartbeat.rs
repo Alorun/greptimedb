@@ -21,6 +21,7 @@ use api::v1::meta::{
     ResponseHeader, Role, heartbeat_server,
 };
 use common_meta::election::LeaderChangeMessage;
+use common_meta::heartbeat;
 use common_telemetry::{debug, error, info, warn};
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
@@ -109,6 +110,15 @@ struct HeartbeatSession<R, L> {
     handler_group: Arc<HeartbeatHandlerGroup>,
     ctx: Context,
     sender_id: PusherId,
+    compact_node_info: bool,
+    static_node_info: Option<StaticNodeInfo>,
+}
+
+/// Fixed fields omitted after the first full node information on this stream.
+struct StaticNodeInfo {
+    version: String,
+    git_commit: String,
+    start_time_ms: u64,
 }
 
 impl<R, L> HeartbeatSession<R, L>
@@ -145,6 +155,10 @@ where
         };
 
         let sender_id = register_pusher(&handler_group, header, tx.clone()).await;
+        let compact_node_info = req
+            .extensions
+            .get(heartbeat::COMPACT_NODE_INFO_KEY)
+            .is_some_and(|value| value == b"1");
         let mut session = Self {
             requests,
             tx,
@@ -152,6 +166,8 @@ where
             handler_group,
             ctx,
             sender_id,
+            compact_node_info,
+            static_node_info: None,
         };
 
         if session.handle_request(req, true).await {
@@ -205,7 +221,7 @@ where
     }
 
     /// Handles the incoming heartbeat request, and returns whether to continue the session.
-    async fn handle_request(&mut self, req: HeartbeatRequest, is_handshake: bool) -> bool {
+    async fn handle_request(&mut self, mut req: HeartbeatRequest, is_handshake: bool) -> bool {
         let mailbox_message_id = req.mailbox_message.as_ref().map(|msg| msg.id);
         debug!(
             sender_id = %self.sender_id,
@@ -219,7 +235,32 @@ where
             .with_label_values(&[sender_id.as_str()])
             .inc();
 
-        let res = self
+        if self.compact_node_info
+            && let Some(info) = req.info.as_mut()
+        {
+            if info.version.is_empty() && info.git_commit.is_empty() && info.start_time_ms == 0 {
+                let Some(cached) = &self.static_node_info else {
+                    let _ = self
+                        .tx
+                        .send(Err(Status::unavailable(
+                            "Missing cached node information; reconnect to send full information",
+                        )))
+                        .await;
+                    return false;
+                };
+                info.version.clone_from(&cached.version);
+                info.git_commit.clone_from(&cached.git_commit);
+                info.start_time_ms = cached.start_time_ms;
+            } else {
+                self.static_node_info = Some(StaticNodeInfo {
+                    version: info.version.clone(),
+                    git_commit: info.git_commit.clone(),
+                    start_time_ms: info.start_time_ms,
+                });
+            }
+        }
+
+        let mut res = self
             .handler_group
             .handle(req, self.ctx.clone().with_handshake(is_handshake))
             .await
@@ -227,6 +268,16 @@ where
                 |e| warn!(e; "Failed to handle heartbeat request, sender: {}", self.sender_id),
             )
             .map_err(|e| e.into());
+
+        if is_handshake
+            && self.compact_node_info
+            && let Ok(response) = res.as_mut()
+            && !response.is_not_leader()
+        {
+            response
+                .extensions
+                .insert(heartbeat::COMPACT_NODE_INFO_KEY.to_string(), b"1".to_vec());
+        }
 
         let is_not_leader = res.as_ref().is_ok_and(|r| r.is_not_leader());
 
@@ -418,7 +469,9 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
 
+    use api::v1::meta::NodeInfo as PbNodeInfo;
     use api::v1::meta::heartbeat_server::Heartbeat;
+    use common_meta::cluster::{NodeInfo, NodeInfoKey};
     use common_meta::kv_backend::memory::MemoryKvBackend;
     use common_telemetry::tracing_context::W3cTrace;
     use servers::grpc::GrpcOptions;
@@ -426,6 +479,7 @@ mod tests {
     use tonic::{Code, IntoRequest};
 
     use super::*;
+    use crate::handler::HeartbeatHandlerGroupBuilder;
     use crate::handler::test_utils::TestEnv;
     use crate::metasrv::MetasrvOptions;
     use crate::metasrv::builder::MetasrvBuilder;
@@ -529,6 +583,142 @@ mod tests {
         rx: &mut mpsc::Receiver<HeartbeatResponseResult>,
     ) -> HeartbeatResponseResult {
         rx.recv().await.unwrap()
+    }
+
+    async fn node_info_session(
+        ctx: Context,
+    ) -> (
+        HeartbeatSession<MockHeartbeatRequestStream, MockLeaderStepDown>,
+        mpsc::Receiver<HeartbeatResponseResult>,
+    ) {
+        let mut handshake = heartbeat_request(Role::Flownode, 42);
+        handshake
+            .extensions
+            .insert(heartbeat::COMPACT_NODE_INFO_KEY.into(), b"1".to_vec());
+        let (tx, mut rx) = mpsc::channel(8);
+        let handlers = HeartbeatHandlerGroupBuilder::new(Default::default())
+            .add_default_handlers()
+            .build()
+            .unwrap();
+        let session = HeartbeatSession::init(
+            MockHeartbeatRequestStream::new(vec![Ok(handshake)]),
+            tx,
+            None::<MockLeaderStepDown>,
+            Arc::new(handlers),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recv_response(&mut rx).await.unwrap().extensions[heartbeat::COMPACT_NODE_INFO_KEY],
+            b"1"
+        );
+        (session, rx)
+    }
+
+    fn node_info_request(compact: bool, cpu: i64) -> HeartbeatRequest {
+        HeartbeatRequest {
+            peer: Some(Peer {
+                id: 42,
+                addr: "node:3001".into(),
+            }),
+            info: Some(PbNodeInfo {
+                version: if compact { "" } else { "v1" }.into(),
+                git_commit: if compact { "" } else { "abc" }.into(),
+                start_time_ms: if compact { 0 } else { 100 },
+                cpu_usage_millicores: cpu,
+                ..Default::default()
+            }),
+            ..heartbeat_request(Role::Flownode, 42)
+        }
+    }
+
+    async fn stored_node_info(ctx: &Context) -> NodeInfo {
+        let key: Vec<u8> = (&NodeInfoKey::new(&node_info_request(false, 0)).unwrap()).into();
+        NodeInfo::try_from(ctx.in_memory.get(&key).await.unwrap().unwrap().value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_compact_node_info_recreates_deleted_record() {
+        let ctx = test_context();
+        let (mut session, mut rx) = node_info_session(ctx.clone()).await;
+        let request = node_info_request(false, 200);
+        assert!(session.handle_request(request.clone(), false).await);
+        recv_response(&mut rx).await.unwrap();
+
+        let key: Vec<u8> = (&NodeInfoKey::new(&request).unwrap()).into();
+        let deleted = ctx.in_memory.delete(&key, true).await.unwrap().unwrap();
+        assert_eq!(
+            NodeInfo::try_from(deleted.value)
+                .unwrap()
+                .cpu_usage_millicores,
+            200
+        );
+        assert!(
+            session
+                .handle_request(node_info_request(true, 0), false)
+                .await
+        );
+        recv_response(&mut rx).await.unwrap();
+
+        let restored = stored_node_info(&ctx).await;
+        assert_eq!(restored.version, "v1");
+        assert_eq!(restored.git_commit, "abc");
+        assert_eq!(restored.start_time_ms, 100);
+        assert_eq!(restored.cpu_usage_millicores, 0);
+        assert!(restored.last_activity_ts > 0);
+    }
+
+    #[tokio::test]
+    async fn test_missing_node_info_cache_closes_stream_and_reconnects() {
+        let ctx = test_context();
+        let (mut session, mut rx) = node_info_session(ctx.clone()).await;
+        assert!(
+            session
+                .handle_request(node_info_request(false, 200), false)
+                .await
+        );
+        recv_response(&mut rx).await.unwrap();
+        let before = serde_json::to_value(stored_node_info(&ctx).await).unwrap();
+
+        session.static_node_info = None;
+        session.requests.messages.extend([
+            Ok(node_info_request(true, 999)),
+            Ok(node_info_request(false, 777)),
+        ]);
+        session.run().await;
+        assert_eq!(
+            recv_response(&mut rx).await.unwrap_err().code(),
+            Code::Unavailable
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert_eq!(
+            serde_json::to_value(stored_node_info(&ctx).await).unwrap(),
+            before,
+        );
+
+        let (mut session, mut rx) = node_info_session(ctx.clone()).await;
+        let mut request = node_info_request(false, 0);
+        let info = request.info.as_mut().unwrap();
+        info.version = "v2".into();
+        info.git_commit = "def".into();
+        info.start_time_ms = 200;
+        assert!(session.handle_request(request, false).await);
+        recv_response(&mut rx).await.unwrap();
+        assert!(
+            session
+                .handle_request(node_info_request(true, 50), false)
+                .await
+        );
+        recv_response(&mut rx).await.unwrap();
+        let restored = stored_node_info(&ctx).await;
+        assert_eq!(restored.version, "v2");
+        assert_eq!(restored.git_commit, "def");
+        assert_eq!(restored.start_time_ms, 200);
+        assert_eq!(restored.cpu_usage_millicores, 50);
     }
 
     #[tokio::test]

@@ -15,3 +15,8 @@
 pub mod handler;
 pub mod mailbox;
 pub mod utils;
+
+/// Request/response extension with value `b"1"` negotiating per-stream caching
+/// of the node version, git commit, and start time.
+/// Once negotiated, all three fields at their protobuf defaults reuse the cache.
+pub const COMPACT_NODE_INFO_KEY: &str = "__compact_node_info";
